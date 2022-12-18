@@ -383,6 +383,11 @@ class ListOf<list<Type> allowedTypes, string descr> :
 
 def AnyTorchListOfTorchBoolType : ListOf<[Torch_BoolType], "Bool list type (bool[])">;
 def AnyTorchListOfTorchIntType : ListOf<[Torch_IntType], "Int list type (int[])">;
+def AnyTorchListOfTorchListOfTorchIntType : ListOf<[AnyTorchListOfTorchIntType], "Int list type (int[[]])">;
+def ShapesType : AnyTypeOf<[
+  AnyTorchListOfTorchIntType,
+  AnyTorchListOfTorchListOfTorchIntType,
+], "Allowed int list or int list list types">;
 def AnyTorchListOfTorchFloatType : ListOf<[Torch_FloatType], "Float list type (float[])">;
 def AnyTorchListOfTorchStringType : ListOf<[Torch_StringType], "Str list type (str[])">;
 def AnyTorchListOfTensorType:

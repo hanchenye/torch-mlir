@@ -1000,6 +1000,23 @@ def aten〇convolution(input: List[int], weight: List[int], bias: Optional[List[
 def aten〇_convolution(input: List[int], weight: List[int], bias: Optional[List[int]], stride: List[int], padding: List[int], dilation: List[int], transposed: bool, output_padding: List[int], groups: int, benchmark: bool, deterministic: bool, cudnn_enabled: bool, allow_tf32: bool) -> List[int]:
     return aten〇convolution(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups)
 
+def aten〇unsafe_chunk(self: List[int], chunks: int, dim: int = 0) -> List[List[int]]:
+    ndim = len(self)
+    assert ndim != 0
+    dim = upstream_shape_functions.maybe_wrap_dim(dim, ndim)
+    dim_size = self[dim]
+
+    assert chunks > 0
+    chunk_size = max(1, -(dim_size // -chunks))
+    last_chunk_size = dim_size % chunk_size
+
+    out = [upstream_shape_functions._copy(self)]
+    out[0][dim] = chunk_size
+    out *= -(dim_size // -chunk_size)
+    if (last_chunk_size):
+        out[-1][dim] = last_chunk_size
+    return out
+
 def aten〇_convolution〇deprecated(input: List[int], weight: List[int], bias: Optional[List[int]], stride: List[int], padding: List[int], dilation: List[int], transposed: bool, output_padding: List[int], groups: int, benchmark: bool, deterministic: bool, cudnn_enabled: bool) -> List[int]:
     return aten〇convolution(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups)
 

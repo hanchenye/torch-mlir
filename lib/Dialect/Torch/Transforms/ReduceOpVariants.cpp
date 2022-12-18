@@ -149,13 +149,51 @@ public:
     // Convert all results.
     rewriter.setInsertionPointAfter(op);
     for (Value result : op->getResults()) {
-      auto tensorType = result.getType().dyn_cast<NonValueTensorType>();
-      if (!tensorType)
-        continue;
-      result.setType(tensorType.getWithValueSemantics());
-      auto nonValueTensor =
-          rewriter.create<CopyToNonValueTensorOp>(op->getLoc(), result);
-      result.replaceAllUsesExcept(nonValueTensor, nonValueTensor);
+      Type resultType = result.getType();
+      if (auto tensorType = resultType.dyn_cast<NonValueTensorType>()) {
+        result.setType(tensorType.getWithValueSemantics());
+        auto nonValueTensor =
+            rewriter.create<CopyToNonValueTensorOp>(op->getLoc(), result);
+        result.replaceAllUsesExcept(nonValueTensor, nonValueTensor);
+      } else if (auto listType = resultType.dyn_cast<ListType>()) {
+        auto elementType =
+            listType.getContainedType().dyn_cast<NonValueTensorType>();
+        if (!elementType)
+          continue;
+
+        if (!result.hasOneUse()) {
+          rewriter.cancelRootUpdate(op);
+          return rewriter.notifyMatchFailure(
+              op, "unimplemented: list of non vtensor used by multiple users");
+        }
+
+        auto listUnpack = dyn_cast<PrimListUnpackOp>(*result.user_begin());
+        if (!listUnpack) {
+          rewriter.cancelRootUpdate(op);
+          return rewriter.notifyMatchFailure(
+              op, "unimplemented: list of non vtensor not unpacked by list "
+                  "unpack operation");
+        }
+
+        Type newListType = getContainerOrTensorTypeWithValueSemantics(listType);
+        if (!newListType) {
+          rewriter.cancelRootUpdate(op);
+          return rewriter.notifyMatchFailure(
+              op, "Unable to convert list type to value semantics.");
+        }
+        result.setType(newListType);
+
+        rewriter.setInsertionPointAfter(listUnpack);
+        for (auto element : listUnpack.getResults()) {
+          auto elementType = element.getType().dyn_cast<NonValueTensorType>();
+          if (!elementType)
+            continue;
+          element.setType(elementType.getWithValueSemantics());
+          auto nonValueElement = rewriter.create<CopyToNonValueTensorOp>(
+              listUnpack->getLoc(), element);
+          element.replaceAllUsesExcept(nonValueElement, nonValueElement);
+        }
+      }
     }
     rewriter.finalizeRootUpdate(op);
     return success();

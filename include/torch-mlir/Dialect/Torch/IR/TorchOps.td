@@ -1200,7 +1200,7 @@ def Torch_ShapeCalculateYieldShapesOp : Torch_Op<"shape.calculate.yield.shapes",
   }];
 
   let arguments = (ins
-    Variadic<AnyTorchListOfTorchIntType>:$results
+    Variadic<ShapesType>:$results
   );
   let results = (outs);
 
