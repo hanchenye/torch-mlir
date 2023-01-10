@@ -706,6 +706,9 @@ void TypeAnalysis::visitOperation(Operation *op,
     return incorporateKnowledge(op->getResult(0), operands[0]->getValue());
   }
 
+  if (isa<AtenEinsumOp>(op))
+    return incorporateKnowledge(op->getResult(0), operands[1]->getValue());
+
   // Dtype is always float32, except for bfloat16, float16, float64 and nullptr.
   if (isa<AtenTanhOp, AtenExpOp, AtenExpm1Op, AtenSinOp, AtenCosOp,
           AtenSigmoidOp, AtenReciprocalOp, AtenLogOp, AtenSqrtOp, AtenLog2Op,

@@ -29,6 +29,136 @@ using namespace mlir::torch;
 using namespace mlir::torch::Torch;
 
 namespace {
+class ConvertAtenEinsumOp : public OpConversionPattern<AtenEinsumOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(AtenEinsumOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op->getLoc();
+    auto ctx = op->getContext();
+
+    if (failed(verifyLinalgCompatibleTypes(op, rewriter)))
+      return failure();
+
+    SmallVector<Value> inputs;
+    if (!getListConstructElements(op.getTensors(), inputs))
+      return rewriter.notifyMatchFailure(
+          op, "only support inputs from a list construct");
+    inputs = getTypeConvertedValues(rewriter, loc, getTypeConverter(), inputs);
+
+    std::string eq;
+    if (!matchPattern(op.getEquation(), m_TorchConstantStr(eq)))
+      return rewriter.notifyMatchFailure(
+          op, "only support equation from a constant string");
+    eq.erase(llvm::remove_if(eq, [](char c) { return c == ' '; }), eq.end());
+
+    auto [inputStr, outputLabels] = StringRef(eq).split("->");
+    if (outputLabels.empty())
+      return rewriter.notifyMatchFailure(op, "output labels are empty");
+    if (llvm::any_of(outputLabels, [](char c) { return !std::isalpha(c); }))
+      return rewriter.notifyMatchFailure(
+          op, "only support alphabetical output labels in equation");
+
+    SmallVector<StringRef> inputLabelsList;
+    inputStr.split(inputLabelsList, ',');
+    assert(inputLabelsList.size() == inputs.size() &&
+           "the number of inputs does not match the number of input labels");
+
+    // Collect the dims of all input tensors.
+    SmallVector<SmallVector<Value>> inputDimsList;
+    for (auto [inputLabels, input] : llvm::zip(inputLabelsList, inputs)) {
+      if (inputLabels.empty())
+        return rewriter.notifyMatchFailure(op, "input labels are empty");
+      if (llvm::any_of(inputLabels, [](char c) { return !std::isalpha(c); }))
+        return rewriter.notifyMatchFailure(
+            op, "only support alphabetical input labels in equation");
+
+      auto inputRank = input.getType().cast<RankedTensorType>();
+      assert(inputLabels.size() == inputRank.getRank() &&
+             "input labels size does not match input rank");
+
+      SmallVector<Value> inputDims;
+      for (unsigned i = 0, e = inputRank.getRank(); i < e; ++i)
+        inputDims.push_back(rewriter.create<tensor::DimOp>(loc, input, i));
+      inputDimsList.push_back(inputDims);
+    }
+
+    // Collect the mapping from label to tensor.dim op and a list of iterator
+    // labels for the linalg.generic op.
+    llvm::SmallDenseMap<char, Value> labelToDim;
+    SmallString<16> iteratorLabels;
+    for (auto [labels, dims] : llvm::zip(inputLabelsList, inputDimsList))
+      for (auto [label, dim] : llvm::zip(labels, dims))
+        if (!labelToDim.count(label)) {
+          labelToDim[label] = dim;
+          iteratorLabels.push_back(label);
+        } else {
+          Value einsumDimEqual = rewriter.create<arith::CmpIOp>(
+              loc, arith::CmpIPredicate::eq, labelToDim.lookup(label), dim);
+          rewriter.create<cf::AssertOp>(
+              loc, einsumDimEqual,
+              rewriter.getStringAttr("mismatching dims for aten.einsum"));
+        }
+
+    // Put together the dims of output tensor.
+    SmallVector<OpFoldResult> outputDims;
+    for (auto label : outputLabels) {
+      assert(labelToDim.count(label) && "invalid output label in equation");
+      outputDims.push_back(labelToDim.lookup(label));
+    }
+
+    // Construct initial output tensor and fill it with zeros.
+    auto newResultType = getTypeConverter()->convertType(op.getType());
+    auto elementType = newResultType.cast<RankedTensorType>().getElementType();
+    auto output =
+        rewriter.create<tensor::EmptyOp>(op.getLoc(), outputDims, elementType);
+    auto c0 = rewriter.create<arith::ConstantOp>(
+        loc, FloatAttr::get(elementType, 0.0));
+    auto zeroFill = rewriter.create<linalg::FillOp>(loc, c0.getResult(),
+                                                    output.getResult());
+
+    // A helper to construct index map.
+    auto getIndexMap = [&](StringRef labels) {
+      SmallVector<AffineExpr> exprs;
+      for (auto label : labels)
+        exprs.push_back(rewriter.getAffineDimExpr(iteratorLabels.find(label)));
+      return AffineMap::get(iteratorLabels.size(), 0, exprs, ctx);
+    };
+
+    // Traverse all input and output labels.
+    SmallVector<AffineMap> indexMaps;
+    for (auto inputLabels : inputLabelsList)
+      indexMaps.push_back(getIndexMap(inputLabels));
+    indexMaps.push_back(getIndexMap(outputLabels));
+
+    // Figure out the iterator types.
+    SmallVector<utils::IteratorType> iteratorTypes;
+    for (auto label : iteratorLabels)
+      iteratorTypes.push_back(outputLabels.count(label)
+                                  ? utils::IteratorType::parallel
+                                  : utils::IteratorType::reduction);
+
+    // Construct the linalg.generic op.
+    auto generic = rewriter.create<linalg::GenericOp>(
+        loc, output.getType(), inputs, zeroFill.getResult(0), indexMaps,
+        iteratorTypes, [&](OpBuilder &b, Location loc, ValueRange args) {
+          Value currentProduct = args.front();
+          for (auto inputArg : args.drop_front().drop_back())
+            currentProduct =
+                b.create<arith::MulFOp>(loc, currentProduct, inputArg);
+          auto mac = b.create<arith::AddFOp>(loc, args.back(), currentProduct);
+          b.create<linalg::YieldOp>(loc, mac.getResult());
+        });
+
+    rewriter.replaceOpWithNewOp<tensor::CastOp>(op, newResultType,
+                                                generic.getResult(0));
+    return success();
+  }
+};
+} // namespace
+
+namespace {
 class ConvertAtenMmOp : public OpConversionPattern<AtenMmOp> {
 public:
   using OpConversionPattern::OpConversionPattern;
@@ -103,7 +233,8 @@ public:
     Location loc = op->getLoc();
     MLIRContext *context = op.getContext();
     Value self = adaptor.getSelf();
-    auto selfRank = adaptor.getSelf().getType().cast<RankedTensorType>().getRank();
+    auto selfRank =
+        adaptor.getSelf().getType().cast<RankedTensorType>().getRank();
     Type elementType =
         adaptor.getSelf().getType().cast<RankedTensorType>().getElementType();
     Value c1 =
@@ -517,7 +648,8 @@ public:
       return rewriter.notifyMatchFailure(op,
                                          "only support constant int strides");
     SmallVector<int64_t> dilationInts;
-    if (!matchPattern(op.getDilation(), m_TorchListOfConstantInts(dilationInts)))
+    if (!matchPattern(op.getDilation(),
+                      m_TorchListOfConstantInts(dilationInts)))
       return rewriter.notifyMatchFailure(op,
                                          "only support constant int dilations");
 
@@ -846,4 +978,6 @@ void mlir::torch::torch_to_linalg::populateLinearPatternsAndLegality(
   patterns.add<ConvertAtenBmmOp>(typeConverter, context);
   target.addIllegalOp<AtenConvolutionOp>();
   patterns.add<ConvertAtenConvolutionOp>(typeConverter, context);
+  target.addIllegalOp<AtenEinsumOp>();
+  patterns.add<ConvertAtenEinsumOp>(typeConverter, context);
 }

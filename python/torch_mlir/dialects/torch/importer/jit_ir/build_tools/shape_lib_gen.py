@@ -1000,6 +1000,30 @@ def aten〇convolution(input: List[int], weight: List[int], bias: Optional[List[
 def aten〇_convolution(input: List[int], weight: List[int], bias: Optional[List[int]], stride: List[int], padding: List[int], dilation: List[int], transposed: bool, output_padding: List[int], groups: int, benchmark: bool, deterministic: bool, cudnn_enabled: bool, allow_tf32: bool) -> List[int]:
     return aten〇convolution(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups)
 
+def aten〇einsum(equation: str, tensors: List[List[int]], path: Optional[List[int]] = None) -> List[int]:
+    assert path is None
+    
+    tmp = "".join(equation.split()).split('->')
+    assert len(tmp) == 2
+
+    input_labels_list = tmp[0].split(',')
+    assert all(labels.isalpha() for labels in input_labels_list)
+
+    output_labels = tmp[1]
+    assert output_labels.isalpha()
+
+    label_map = {'': 0}
+    assert len(input_labels_list) == len(tensors)
+    for labels, shape in zip(input_labels_list, tensors):
+        assert len(labels) == len(shape)
+        for label, dim in zip(labels, shape):
+            if label in label_map:
+                assert label_map[label] == dim
+            else:
+                label_map[label] = dim
+    
+    return [label_map[label] for label in output_labels]
+
 def aten〇unsafe_chunk(self: List[int], chunks: int, dim: int = 0) -> List[List[int]]:
     ndim = len(self)
     assert ndim != 0
