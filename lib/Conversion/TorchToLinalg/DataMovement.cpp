@@ -128,6 +128,102 @@ LogicalResult prepareArgumentsForSlicingOp(OpTy op, OpAdaptor adaptor,
 }
 
 namespace {
+class ConvertAtenStackOp : public OpConversionPattern<AtenStackOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(AtenStackOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op->getLoc();
+
+    if (failed(verifyLinalgCompatibleTypes(op, rewriter)))
+      return failure();
+
+    SmallVector<Value> inputs;
+    if (!getListConstructElements(op.getTensors(), inputs))
+      return rewriter.notifyMatchFailure(
+          op, "only support inputs from a list construct");
+    inputs = getTypeConvertedValues(rewriter, loc, getTypeConverter(), inputs);
+    auto outputType =
+        getTypeConverter()->convertType(op.getType()).cast<RankedTensorType>();
+
+    // TODO: We force static shape inputs.
+    if (!outputType.hasStaticShape() || llvm::any_of(inputs, [](Value input) {
+          return !input.getType().cast<RankedTensorType>().hasStaticShape();
+        }))
+      return rewriter.notifyMatchFailure(op, "unimplemented: dynamic shape");
+
+    int64_t dim;
+    if (!matchPattern(op.getDim(), m_TorchConstantInt(&dim)))
+      return rewriter.notifyMatchFailure(
+          op, "only support dimension from a constant int");
+
+    // Get rank and shape from the first input tensor - all the input tensors
+    // should share the same shape.
+    auto rank = inputs[0].getType().cast<RankedTensorType>().getRank();
+    SmallVector<int64_t> shape(
+        inputs[0].getType().cast<RankedTensorType>().getShape());
+    shape.insert(shape.begin() + dim, 1);
+
+    // Get the offsets and strides of the first input tensor.
+    SmallVector<int64_t> offsets(rank + 1, 0);
+    SmallVector<int64_t> strides(rank + 1, 1);
+
+    // Construct initial output tensor.
+    auto elementType = outputType.getElementType();
+    auto output = rewriter.create<tensor::EmptyOp>(
+        op.getLoc(), outputType.getShape(), elementType);
+
+    // Construct the expand_shape op for input tensors.
+    SmallVector<ReassociationIndices> reassociation;
+    for (unsigned i = 0; i < rank; ++i) {
+      if (i < dim)
+        reassociation.push_back({i});
+      else if (i == dim)
+        reassociation.push_back({i, i + 1});
+      else
+        reassociation.push_back({i + 1});
+    }
+    auto expand = rewriter.create<tensor::ExpandShapeOp>(
+        op.getLoc(), RankedTensorType::get(shape, elementType), inputs[0],
+        reassociation);
+
+    // Construct the first insert_slice op.
+    auto getOpFoldResultArray = [&](ArrayRef<int64_t> array) {
+      SmallVector<OpFoldResult> result;
+      for (auto value : array)
+        result.push_back(rewriter.getIndexAttr(value));
+      return result;
+    };
+
+    auto insert = rewriter.create<tensor::InsertSliceOp>(
+        op.getLoc(), expand, output, getOpFoldResultArray(offsets),
+        getOpFoldResultArray(shape), getOpFoldResultArray(strides));
+
+    // Traverse the rest input tensors and construct all insert_slice ops.
+    for (auto input : llvm::enumerate(llvm::drop_begin(inputs))) {
+      // Ensure the current tensor have the same rank and shape.
+      if (input.value().getType().cast<RankedTensorType>().getRank() != rank)
+        return op.emitOpError("all inputs must have same rank");
+
+      // Construct the expand_shape and insert_slice op.
+      offsets[dim] = input.index() + 1;
+      expand = rewriter.create<tensor::ExpandShapeOp>(
+          op.getLoc(), RankedTensorType::get(shape, elementType), input.value(),
+          reassociation);
+      insert = rewriter.create<tensor::InsertSliceOp>(
+          op.getLoc(), expand, insert, getOpFoldResultArray(offsets),
+          getOpFoldResultArray(shape), getOpFoldResultArray(strides));
+    }
+
+    rewriter.replaceOpWithNewOp<tensor::CastOp>(op, outputType,
+                                                insert.getResult());
+    return success();
+  }
+};
+} // namespace
+
+namespace {
 class ConvertAtenFlattenUsingIntsOp
     : public OpConversionPattern<AtenFlattenUsingIntsOp> {
 public:
@@ -666,8 +762,9 @@ public:
         intermediateShape.push_back(sum);
       }
 
-      Type intermediateResultType = RankedTensorType::get(
-          makeShapeLLVMCompatible(intermediateShape), resultType.getElementType());
+      Type intermediateResultType =
+          RankedTensorType::get(makeShapeLLVMCompatible(intermediateShape),
+                                resultType.getElementType());
 
       expandedInput =
           rewriter
@@ -1032,10 +1129,10 @@ public:
     for (unsigned i = 0; i < inputRank; i++)
       swapExprs.push_back(idExprs[dimensions[i]]);
 
-    AffineMap inputMap = AffineMap::get(inputRank, /*symbolCount=*/0, idExprs,
-                                        op->getContext());
-    AffineMap outputMap = AffineMap::get(inputRank, /*symbolCount=*/0, swapExprs,
-                                         op->getContext());
+    AffineMap inputMap =
+        AffineMap::get(inputRank, /*symbolCount=*/0, idExprs, op->getContext());
+    AffineMap outputMap = AffineMap::get(inputRank, /*symbolCount=*/0,
+                                         swapExprs, op->getContext());
     SmallVector<AffineMap> indexingMaps{inputMap, outputMap};
     SmallVector<utils::IteratorType> iteratorTypes(
         inputRank, utils::IteratorType::parallel);
@@ -1215,7 +1312,8 @@ public:
       return failure();
 
     Type resultType = getTypeConverter()->convertType(op.getType());
-    rewriter.replaceOpWithNewOp<tensor::CastOp>(op, resultType, adaptor.getSelf());
+    rewriter.replaceOpWithNewOp<tensor::CastOp>(op, resultType,
+                                                adaptor.getSelf());
     return success();
   }
 };
@@ -1368,4 +1466,6 @@ void mlir::torch::torch_to_linalg::populateDataMovementPatternsAndLegality(
   patterns.add<ConvertAtenCopyOp>(typeConverter, context);
   target.addIllegalOp<AtenSliceScatterOp>();
   patterns.add<ConvertAtenSliceScatterOp>(typeConverter, context);
+  target.addIllegalOp<AtenStackOp>();
+  patterns.add<ConvertAtenStackOp>(typeConverter, context);
 }

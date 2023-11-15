@@ -62,8 +62,9 @@ public:
 
     SmallVector<StringRef> inputLabelsList;
     inputStr.split(inputLabelsList, ',');
-    assert(inputLabelsList.size() == inputs.size() &&
-           "the number of inputs does not match the number of input labels");
+    if (inputLabelsList.size() != inputs.size())
+      return op.emitOpError(
+          "the number of inputs does not match the number of input labels");
 
     // Collect the dims of all input tensors.
     SmallVector<SmallVector<Value>> inputDimsList;
@@ -75,8 +76,8 @@ public:
             op, "only support alphabetical input labels in equation");
 
       auto inputRank = input.getType().cast<RankedTensorType>();
-      assert(inputLabels.size() == inputRank.getRank() &&
-             "input labels size does not match input rank");
+      if (inputLabels.size() != inputRank.getRank())
+        return op.emitOpError("input labels size does not match input rank");
 
       SmallVector<Value> inputDims;
       for (unsigned i = 0, e = inputRank.getRank(); i < e; ++i)
@@ -104,7 +105,8 @@ public:
     // Put together the dims of output tensor.
     SmallVector<OpFoldResult> outputDims;
     for (auto label : outputLabels) {
-      assert(labelToDim.count(label) && "invalid output label in equation");
+      if (!labelToDim.count(label))
+        return op.emitOpError("invalid output label in equation");
       outputDims.push_back(labelToDim.lookup(label));
     }
 
